@@ -116,7 +116,12 @@ def load_ha_config():
             'gammu_operation_delay': 0.3,
             'callback_read_interval': 2,
             'gammu_process_worker': True,
-            'gammu_operation_timeout': 90
+            'gammu_operation_timeout': 90,
+            'sms_recovery_mode': 'reinit',
+            'sms_recovery_interval': 300,
+            'sms_recovery_delay': 5,
+            'sms_burst_after_send_seconds': 120,
+            'sms_burst_interval': 10
         }
 
 # Load version and configuration
@@ -723,6 +728,19 @@ class Reset(Resource):
             return {"status": 200, "message": "Gammu connection reinitialized"}, 200
         except Exception as e:
             api.abort(503, f"Failed to reinitialize modem: {str(e)}")
+
+@ns_status.route('/sms-recover')
+@ns_status.doc('recover_sms_reception')
+class SmsRecover(Resource):
+    @ns_status.doc('sms_reception_recovery')
+    @ns_status.marshal_with(reset_response)
+    def get(self):
+        """Run SMS reception recovery (reinit or soft reset, depending on configuration)."""
+        try:
+            mqtt_publisher.recover_sms_reception("manual /status/sms-recover request", force=True)
+            return {"status": 200, "message": "SMS reception recovery requested"}, 200
+        except Exception as e:
+            api.abort(503, f"Failed to recover SMS reception: {str(e)}")
 
 @ns_calls.route('/dial')
 @ns_calls.doc('call_operations')

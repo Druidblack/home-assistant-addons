@@ -239,6 +239,20 @@ class MQTTPublisher:
         self.callback_read_interval = float(config.get('callback_read_interval', 2) or 2)
         self._last_reinit_attempt = 0.0
 
+        # SMS reception recovery. Some Huawei/USB modems keep answering status
+        # commands after a failed/voice call, but stop delivering MT-SMS until
+        # a deeper modem interaction happens. Periodic reinit plus a short
+        # polling burst after outgoing SMS makes this failure mode recoverable.
+        self.sms_recovery_mode = str(config.get('sms_recovery_mode', 'reinit') or 'reinit').lower()
+        self.sms_recovery_interval = int(config.get('sms_recovery_interval', 300) or 0)
+        self.sms_recovery_delay = int(config.get('sms_recovery_delay', 5) or 0)
+        self.sms_burst_after_send_seconds = int(config.get('sms_burst_after_send_seconds', 120) or 0)
+        self.sms_burst_interval = int(config.get('sms_burst_interval', 10) or 10)
+        self._last_sms_recovery = time.time()
+        self._sms_burst_until = 0.0
+        self._sms_monitor_event = threading.Event()
+        self._seen_sms_keys = set()
+
         # SMS callback (faster delivery, polling as fallback)
         self.sms_callback_enabled = False
         self._sms_callback_pending = False  # flag že přišla SMS
@@ -578,6 +592,10 @@ class MQTTPublisher:
                 self.sms_counter.increment()
             self.publish_sms_counter()
             logger.info(f"📊 SMS counter incremented by {len(messages)} to: {self.sms_counter.get_count()}")
+
+            # Outgoing SMS often wakes delivery of queued incoming SMS on some
+            # USB modems; poll immediately and then more frequently for a while.
+            self._activate_sms_burst("after successful SendSMS")
 
             # Publish confirmation
             if self.connected:
@@ -1648,6 +1666,108 @@ class MQTTPublisher:
             self._post_call_recovery_until = None
         return False
 
+    def _sms_identity_key(self, sms):
+        """Return a stable-ish identity for duplicate protection during polling."""
+        locations = sms.get('Locations') or []
+        try:
+            locations_part = ','.join(str(x) for x in locations)
+        except Exception:
+            locations_part = str(locations)
+        return "|".join([
+            str(sms.get('Date', '')),
+            str(sms.get('Number', '')),
+            str(sms.get('State', '')),
+            str(sms.get('Text', '')),
+            locations_part,
+        ])
+
+    def _request_sms_poll(self, reason="manual request"):
+        """Wake the SMS polling loop so it does not have to wait for the full interval."""
+        try:
+            logger.info(f"📱 Requesting immediate SMS polling ({reason})")
+            self._sms_monitor_event.set()
+        except Exception:
+            pass
+
+    def _activate_sms_burst(self, reason="SMS burst"):
+        """Temporarily poll SMS more often after recovery/send operations."""
+        if self.sms_burst_after_send_seconds <= 0:
+            return
+        self._sms_burst_until = max(self._sms_burst_until, time.time() + self.sms_burst_after_send_seconds)
+        logger.info(
+            f"📱 SMS polling burst active for {self.sms_burst_after_send_seconds}s "
+            f"(interval {self.sms_burst_interval}s): {reason}"
+        )
+        self._request_sms_poll(reason)
+
+    def _sms_poll_wait(self, default_interval):
+        """Wait until the next SMS poll, with optional burst mode/event wakeup."""
+        wait_time = default_interval
+        if self._sms_burst_until and time.time() < self._sms_burst_until:
+            wait_time = min(default_interval, self.sms_burst_interval)
+        elif self._sms_burst_until and time.time() >= self._sms_burst_until:
+            self._sms_burst_until = 0.0
+        self._sms_monitor_event.wait(wait_time)
+        self._sms_monitor_event.clear()
+
+    def recover_sms_reception(self, reason="SMS reception recovery", force=False):
+        """Recover SMS delivery without requiring an outgoing SMS from the user.
+
+        mode=off        -> no-op
+        mode=reinit     -> Terminate/Init the Gammu connection / worker
+        mode=soft_reset -> Gammu Reset(False), then reinitialize the worker
+        """
+        mode = self.sms_recovery_mode
+        if mode in ('', 'off', 'disabled', 'false', 'none'):
+            logger.debug(f"SMS recovery disabled, skipping: {reason}")
+            return False
+
+        now = time.time()
+        if not force and self.sms_recovery_interval > 0:
+            elapsed = now - self._last_sms_recovery
+            if elapsed < self.sms_recovery_interval:
+                return False
+
+        if not self.gammu_machine:
+            logger.warning("Cannot recover SMS reception: Gammu machine is not set")
+            return False
+
+        self._last_sms_recovery = now
+        logger.warning(f"🔄 SMS reception recovery ({mode}): {reason}")
+
+        if mode == 'soft_reset':
+            try:
+                # Gammu Reset(False) is stronger than Terminate/Init and often enough
+                # to clear voice/SMS state after a failed incoming call.
+                self.track_gammu_operation("Reset", self.gammu_machine.Reset, False)
+                logger.info("✅ Gammu soft reset completed")
+            except Exception as e:
+                logger.warning(f"⚠️ Gammu soft reset failed, continuing with reinit: {e}")
+
+            if self.sms_recovery_delay > 0:
+                time.sleep(self.sms_recovery_delay)
+
+            self.reinitialize_gammu(f"{reason} after soft reset", force=True)
+        elif mode == 'reinit':
+            self.reinitialize_gammu(reason, force=True)
+        else:
+            logger.warning(f"Unknown sms_recovery_mode='{mode}', falling back to reinit")
+            self.reinitialize_gammu(reason, force=True)
+
+        # After recovery, poll faster for a while because delayed SMS can arrive
+        # in several batches from the network/SIM storage.
+        self._activate_sms_burst(reason)
+        return True
+
+    def _maybe_periodic_sms_recovery(self):
+        """Run periodic SMS recovery from the SMS monitor loop."""
+        if self.sms_recovery_interval <= 0:
+            return False
+        return self.recover_sms_reception(
+            f"periodic SMS recovery every {self.sms_recovery_interval}s",
+            force=False,
+        )
+
     def reinitialize_gammu(self, reason="automatic recovery", force=False):
         """Fully reinitialize Gammu connection and re-register callbacks when needed."""
         now = time.time()
@@ -1892,6 +2012,14 @@ class MQTTPublisher:
             while self.connected and not self.disconnecting:
                 from support import retrieveAllSms, deleteSms
 
+                # Periodically reinitialize/soft-reset the SMS path. This catches the
+                # post-incoming-call state where status commands work but MT-SMS delivery
+                # remains stuck until the modem is nudged by an outgoing operation.
+                try:
+                    self._maybe_periodic_sms_recovery()
+                except Exception as e:
+                    logger.warning(f"⚠️ Periodic SMS recovery failed: {e}")
+
                 # Check for new SMS with connectivity tracking (this will handle errors and update status)
                 try:
                     all_sms = self.track_gammu_operation("retrieveAllSms", retrieveAllSms, gammu_machine)
@@ -1915,16 +2043,22 @@ class MQTTPublisher:
                         except Exception as reset_err:
                             logger.error(f"❌ Modem soft reset failed: {reset_err}")
 
-                    time.sleep(check_interval)
+                    self._sms_poll_wait(check_interval)
                     continue
 
                 try:
+                    deleted_count = 0
+                    auto_delete = self.config.get('auto_delete_read_sms', False)
+
                     if first_run:
-                        # On first run, publish only unread SMS newer than last processed time
+                        # On first run, publish only unread SMS newer than persisted state,
+                        # but remember all existing messages so old Read/Sent storage entries
+                        # are not treated as new on the next cycle.
                         logger.info(f"📱 Initial SMS check: {current_count} total SMS on SIM")
                         unread_count = 0
                         skipped_count = 0
                         for sms in all_sms:
+                            self._seen_sms_keys.add(self._sms_identity_key(sms))
                             if sms.get('State') == 'UnRead':
                                 if self.sms_processed.is_new_sms(sms):
                                     sms_copy = sms.copy()
@@ -1942,41 +2076,47 @@ class MQTTPublisher:
                             logger.info(f"📱 No unread SMS messages to publish")
 
                         self.sms_processed.update()
-                        last_sms_count = current_count
                         first_run = False
-                    elif current_count > last_sms_count:
-                        # On subsequent runs, publish all new SMS
-                        logger.info(f"📱 Detected {current_count - last_sms_count} new SMS messages")
+                    else:
+                        # Do not rely only on message count. Some modems keep a sent/old
+                        # message in storage or reuse storage counts, so count-based logic
+                        # can miss delayed SMS. Publish every unseen Read/UnRead message.
+                        new_items = []
+                        for i, sms in enumerate(all_sms):
+                            state = sms.get('State')
+                            if state not in ['Read', 'UnRead']:
+                                continue
+                            key = self._sms_identity_key(sms)
+                            if key in self._seen_sms_keys:
+                                continue
+                            self._seen_sms_keys.add(key)
+                            new_items.append((i, sms))
 
-                        deleted_count = 0
-                        auto_delete = self.config.get('auto_delete_read_sms', False)
+                        if new_items:
+                            logger.info(f"📱 Detected {len(new_items)} new SMS messages")
 
-                        # Process new SMS (from the end, newest first)
-                        for i in range(last_sms_count, current_count):
-                            if i < len(all_sms):
-                                sms = all_sms[i].copy()
-                                sms.pop("Locations", None)
+                        for i, sms in new_items:
+                            sms_copy = sms.copy()
+                            sms_copy.pop("Locations", None)
 
-                                # Publish to MQTT
-                                self.publish_sms_received(sms)
+                            self.publish_sms_received(sms_copy)
 
-                                # Auto-delete if enabled and SMS is read
-                                if auto_delete and sms.get('State') in ['Read', 'UnRead']:
-                                    try:
-                                        self.track_gammu_operation("deleteSms", deleteSms, gammu_machine, all_sms[i])
-                                        logger.info(f"🗑️ Auto-deleted SMS from {sms.get('Number', 'Unknown')}")
-                                        deleted_count += 1
-                                    except Exception as e:
-                                        logger.error(f"Error auto-deleting SMS: {e}")
+                            if auto_delete and sms.get('State') in ['Read', 'UnRead']:
+                                try:
+                                    self.track_gammu_operation("deleteSms", deleteSms, gammu_machine, sms)
+                                    logger.info(f"🗑️ Auto-deleted SMS from {sms.get('Number', 'Unknown')}")
+                                    deleted_count += 1
+                                except Exception as e:
+                                    logger.error(f"Error auto-deleting SMS: {e}")
 
-                        self.sms_processed.update()
+                        if new_items:
+                            self.sms_processed.update()
 
-                        # If we auto-deleted any SMS, update capacity and get new count
+                        # If we auto-deleted any SMS, update capacity and get new count.
                         if auto_delete and deleted_count > 0:
                             try:
                                 capacity = self.track_gammu_operation("GetSMSStatus", gammu_machine.GetSMSStatus)
                                 self.publish_sms_capacity(capacity)
-                                # Update count to reflect deleted SMS
                                 current_count = capacity.get('SIMUsed', 0) + capacity.get('PhoneUsed', 0)
                                 logger.info(f"📊 After auto-delete: {current_count} SMS remaining on SIM")
                             except Exception as e:
@@ -1991,7 +2131,7 @@ class MQTTPublisher:
                 # Missed calls jsou nyní monitorovány real-time přes callbacky
                 # (start_callback_monitoring spouští ReadDevice loop)
 
-                time.sleep(check_interval)
+                self._sms_poll_wait(check_interval)
         
         # Only start if both MQTT and SMS monitoring are enabled  
         if (self.config.get('mqtt_enabled', False) and 
