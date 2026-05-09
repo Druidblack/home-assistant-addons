@@ -37,6 +37,132 @@ commtimeout = {commtimeout}
         f.write(config_content)
 
 
+
+
+def _connection_baudrate(connection):
+    """Infer serial baudrate from Gammu connection name (at115200, at9600, ...)."""
+    connection = str(connection or 'at')
+    if connection.startswith('at') and len(connection) > 2:
+        suffix = connection[2:]
+        if suffix.isdigit():
+            return int(suffix)
+    # Huawei USB modems usually accept 115200 on their AT port even when Gammu
+    # uses the generic autobaud "at" connection.
+    return 115200
+
+
+def _read_serial_response(ser, timeout):
+    """Read a compact AT response without blocking forever."""
+    deadline = time.time() + max(0.5, float(timeout or 5))
+    chunks = []
+    while time.time() < deadline:
+        try:
+            waiting = getattr(ser, 'in_waiting', 0)
+            data = ser.read(waiting or 1)
+        except Exception:
+            break
+        if data:
+            try:
+                text = data.decode('utf-8', errors='replace')
+            except Exception:
+                text = repr(data)
+            chunks.append(text)
+            joined = ''.join(chunks)
+            if '\nOK' in joined or '\rOK' in joined or 'ERROR' in joined or '+CME ERROR' in joined or '+CMS ERROR' in joined:
+                break
+        else:
+            time.sleep(0.05)
+    return ''.join(chunks).strip()
+
+
+def _run_raw_at_sequence(device_path, connection, commands, at_timeout=5, command_delay=0.5, reason='raw AT sequence'):
+    """Run raw AT commands outside python-gammu.
+
+    This is used only for recovery modes where Gammu status commands keep
+    working but the modem/network stops delivering MT-SMS until a deeper AT
+    interaction happens. The owning Gammu StateMachine must be terminated before
+    calling this helper.
+    """
+    import serial
+
+    baudrate = _connection_baudrate(connection)
+    results = []
+    logging.warning("📟 Raw AT recovery started (%s): device=%s baudrate=%s", reason, device_path, baudrate)
+
+    with serial.Serial(device_path, baudrate=baudrate, timeout=0.3, write_timeout=max(1, int(at_timeout or 5))) as ser:
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            pass
+
+        for item in commands:
+            if isinstance(item, dict):
+                sleep_for = float(item.get('sleep', 0) or 0)
+                if sleep_for > 0:
+                    logging.info("📟 Raw AT recovery sleep %.1fs", sleep_for)
+                    time.sleep(sleep_for)
+                continue
+
+            command = str(item).strip()
+            if not command:
+                continue
+            wire = (command + '\r').encode('ascii', errors='ignore')
+            logging.info("📟 AT > %s", command)
+            ser.write(wire)
+            ser.flush()
+            response = _read_serial_response(ser, at_timeout)
+            if response:
+                compact = ' | '.join(line.strip() for line in response.replace('\r', '\n').split('\n') if line.strip())
+                logging.info("📟 AT < %s", compact[:500])
+            else:
+                logging.info("📟 AT < <no response>")
+            results.append({'command': command, 'response': response})
+            if command_delay > 0:
+                time.sleep(command_delay)
+
+    logging.warning("✅ Raw AT recovery completed (%s)", reason)
+    return results
+
+
+def build_sms_wake_commands(mode):
+    """Build conservative AT recovery sequences for stuck MT-SMS delivery."""
+    mode = str(mode or '').lower()
+    sms_init = [
+        'AT',
+        'ATE0',
+        'AT+CMEE=2',
+        'AT+CPIN?',
+        'AT+CMGF=1',
+        # Force SIM storage. Huawei sticks can otherwise keep messages in a
+        # storage Gammu does not scan consistently after voice/network events.
+        'AT+CPMS="SM","SM","SM"',
+        'AT+CPMS?',
+        # Huawei/Gammu issue #486 shows E3531 users sometimes need CNMI
+        # 2,0,0,2,1 instead of the Gammu default 2,1,0,2.
+        'AT+CNMI=2,0,0,2,1',
+        'AT+CNMI?',
+        'AT+CSQ',
+        'AT+CREG?',
+    ]
+    if mode in ('at_wake', 'cnmi', 'sms_init'):
+        return sms_init
+    if mode in ('network_wake', 'cfun', 'radio'):
+        return [
+            'AT',
+            'ATE0',
+            'AT+CMEE=2',
+            'AT+CFUN?',
+            'AT+CFUN=0',
+            {'sleep': 8},
+            'AT+CFUN=1',
+            {'sleep': 20},
+            'AT+CPIN?',
+            'AT+CREG?',
+            'AT+CSQ',
+        ] + sms_init[4:]
+    return sms_init
+
 def _create_raw_state_machine(settings):
     """Create and initialize a raw gammu.StateMachine inside the owning process."""
     pin = settings.get('pin')
@@ -118,6 +244,23 @@ def _gammu_process_worker(settings, request_queue, response_queue):
                 time.sleep(1)
                 ensure_machine()
                 response_queue.put({'id': request_id, 'ok': True, 'result': True})
+                continue
+
+            if operation == '_raw_at_sequence':
+                commands = args[0] if args else []
+                terminate_machine()
+                result = _run_raw_at_sequence(
+                    settings.get('device_path', '/dev/ttyUSB0'),
+                    settings.get('connection', 'at'),
+                    commands,
+                    at_timeout=kwargs.get('at_timeout', 5),
+                    command_delay=kwargs.get('command_delay', 0.5),
+                    reason=kwargs.get('reason', 'raw AT recovery'),
+                )
+                # Recreate Gammu immediately after raw AT so the next normal
+                # operation does not have to pay initialization cost.
+                ensure_machine()
+                response_queue.put({'id': request_id, 'ok': True, 'result': result})
                 continue
 
             sm = ensure_machine()
@@ -281,6 +424,17 @@ class GammuProcessClient:
             self._start_worker(reason=reason)
             return self.call('_ping', timeout=max(self.operation_timeout, self.commtimeout + 30))
 
+    def RawATSequence(self, commands, reason='raw AT recovery', at_timeout=5, command_delay=0.5):
+        timeout = max(self.operation_timeout, int(at_timeout or 5) * max(1, len(commands)) + 45)
+        return self.call(
+            '_raw_at_sequence',
+            commands,
+            timeout=timeout,
+            reason=reason,
+            at_timeout=at_timeout,
+            command_delay=command_delay,
+        )
+
     def Terminate(self):
         self._stop_worker(kill=False)
         return True
@@ -406,6 +560,28 @@ commtimeout = {self.commtimeout}
             except Exception:
                 pass
             raise last_error
+
+    def RawATSequence(self, commands, reason='raw AT recovery', at_timeout=5, command_delay=0.5):
+        with self._lock:
+            old_machine = self._machine
+            if old_machine is not None:
+                try:
+                    old_machine.Terminate()
+                    time.sleep(1)
+                except Exception as e:
+                    logging.debug("Ignoring Terminate() error before raw AT sequence: %s", e)
+                self._machine = None
+
+            result = _run_raw_at_sequence(
+                self.device_path,
+                self.connection,
+                commands,
+                at_timeout=at_timeout,
+                command_delay=command_delay,
+                reason=reason,
+            )
+            self.reinitialize(reason=f"after {reason}")
+            return result
 
     def __getattr__(self, name):
         machine = self._machine

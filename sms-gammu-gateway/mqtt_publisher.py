@@ -246,6 +246,8 @@ class MQTTPublisher:
         self.sms_recovery_mode = str(config.get('sms_recovery_mode', 'reinit') or 'reinit').lower()
         self.sms_recovery_interval = int(config.get('sms_recovery_interval', 300) or 0)
         self.sms_recovery_delay = int(config.get('sms_recovery_delay', 5) or 0)
+        self.sms_wake_at_timeout = int(config.get('sms_wake_at_timeout', 5) or 5)
+        self.sms_wake_command_delay = float(config.get('sms_wake_command_delay', 0.5) or 0.5)
         self.sms_burst_after_send_seconds = int(config.get('sms_burst_after_send_seconds', 120) or 0)
         self.sms_burst_interval = int(config.get('sms_burst_interval', 10) or 10)
         self._last_sms_recovery = time.time()
@@ -1713,9 +1715,11 @@ class MQTTPublisher:
     def recover_sms_reception(self, reason="SMS reception recovery", force=False):
         """Recover SMS delivery without requiring an outgoing SMS from the user.
 
-        mode=off        -> no-op
-        mode=reinit     -> Terminate/Init the Gammu connection / worker
-        mode=soft_reset -> Gammu Reset(False), then reinitialize the worker
+        mode=off          -> no-op
+        mode=reinit       -> Terminate/Init the Gammu connection / worker
+        mode=soft_reset   -> Gammu Reset(False), then reinitialize the worker
+        mode=at_wake      -> run raw AT SMS init commands: CPMS/CNMI/CMGF
+        mode=network_wake -> cycle radio with CFUN=0/1, then SMS init commands
         """
         mode = self.sms_recovery_mode
         if mode in ('', 'off', 'disabled', 'false', 'none'):
@@ -1750,6 +1754,22 @@ class MQTTPublisher:
             self.reinitialize_gammu(f"{reason} after soft reset", force=True)
         elif mode == 'reinit':
             self.reinitialize_gammu(reason, force=True)
+        elif mode in ('at_wake', 'cnmi', 'sms_init', 'network_wake', 'cfun', 'radio'):
+            try:
+                from support import build_sms_wake_commands
+                commands = build_sms_wake_commands(mode)
+                self.track_gammu_operation(
+                    "RawATSequence",
+                    self.gammu_machine.RawATSequence,
+                    commands,
+                    reason=f"{reason}; mode={mode}",
+                    at_timeout=self.sms_wake_at_timeout,
+                    command_delay=self.sms_wake_command_delay,
+                )
+                logger.info(f"✅ SMS raw AT wake completed: mode={mode}")
+            except Exception as e:
+                logger.warning(f"⚠️ SMS raw AT wake failed, falling back to reinit: {e}")
+                self.reinitialize_gammu(f"{reason} after failed raw AT wake", force=True)
         else:
             logger.warning(f"Unknown sms_recovery_mode='{mode}', falling back to reinit")
             self.reinitialize_gammu(reason, force=True)

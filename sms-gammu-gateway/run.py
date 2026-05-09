@@ -117,9 +117,11 @@ def load_ha_config():
             'callback_read_interval': 2,
             'gammu_process_worker': True,
             'gammu_operation_timeout': 90,
-            'sms_recovery_mode': 'reinit',
+            'sms_recovery_mode': 'at_wake',
             'sms_recovery_interval': 300,
             'sms_recovery_delay': 5,
+            'sms_wake_at_timeout': 5,
+            'sms_wake_command_delay': 0.5,
             'sms_burst_after_send_seconds': 120,
             'sms_burst_interval': 10
         }

@@ -1,8 +1,8 @@
 {
   "name": "SMS Gammu Gateway",
-  "version": "1.6.5-stable4",
+  "version": "1.6.5-stable5",
   "slug": "sms_gammu_gateway",
-  "description": "SMS gateway for USB GSM modems with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with isolated Gammu worker process, hard operation timeout, safer polling defaults, periodic SMS recovery for modem post-call delivery issues and legacy API aliases.",
+  "description": "SMS gateway for USB GSM modems with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with isolated Gammu worker process, hard operation timeout, safer polling defaults, raw AT SMS wake recovery for Huawei post-call delivery issues and legacy API aliases.",
   "startup": "services",
   "arch": [
     "amd64",
@@ -46,11 +46,13 @@
     "device_wait_seconds": 20,
     "gammu_process_worker": true,
     "gammu_operation_timeout": 90,
-    "sms_recovery_mode": "reinit",
-    "sms_recovery_interval": 60,
+    "sms_recovery_mode": "at_wake",
+    "sms_recovery_interval": 300,
     "sms_recovery_delay": 5,
     "sms_burst_after_send_seconds": 120,
-    "sms_burst_interval": 10
+    "sms_burst_interval": 10,
+    "sms_wake_at_timeout": 5,
+    "sms_wake_command_delay": 0.5
   },
   "schema": {
     "device_path": "str",
@@ -83,11 +85,13 @@
     "device_wait_seconds": "int(0,300)",
     "gammu_process_worker": "bool",
     "gammu_operation_timeout": "int(30,600)",
-    "sms_recovery_mode": "list(off|reinit|soft_reset)",
+    "sms_recovery_mode": "list(off|reinit|soft_reset|at_wake|network_wake)",
     "sms_recovery_interval": "int(0,86400)",
     "sms_recovery_delay": "int(0,120)",
     "sms_burst_after_send_seconds": "int(0,1800)",
-    "sms_burst_interval": "int(1,300)"
+    "sms_burst_interval": "int(1,300)",
+    "sms_wake_at_timeout": "int(1,30)",
+    "sms_wake_command_delay": "float(0,10)"
   },
   "ingress": true,
   "ingress_port": 5000,
