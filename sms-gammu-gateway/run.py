@@ -16,7 +16,7 @@ from flask import Flask, request, render_template
 from flask_httpauth import HTTPBasicAuth
 from flask_restx import Api, Resource, fields, reqparse, apidoc
 
-from support import init_state_machine, retrieveAllSms, deleteSms, encodeSms
+from support import init_state_machine, retrieveAllSms, deleteSms, encodeSms, apply_smsc_to_message
 from mqtt_publisher import MQTTPublisher
 from gammu import GSMNetworks
 
@@ -99,6 +99,8 @@ def load_ha_config():
             'mqtt_username': '',
             'mqtt_password': '',
             'mqtt_topic_prefix': 'homeassistant/sensor/sms_gateway',
+            'smsc_number': '',
+            'smsc_mode': 'auto',
             'sms_monitoring_enabled': True,
             'sms_check_interval': 60,
             'sms_cost_per_message': 0.0,
@@ -108,7 +110,7 @@ def load_ha_config():
             'incoming_call_auto_reset_seconds': 60,
             'voice_call_enabled': False,
             'gammu_connection': 'at',
-            'gammu_commtimeout': 30,
+            'gammu_commtimeout': 40,
             'gammu_init_retries': 3,
             'gammu_init_retry_delay': 5,
             'gammu_reinit_after_failures': 3,
@@ -143,7 +145,7 @@ machine = init_state_machine(
     pin,
     device_path,
     connection=config.get('gammu_connection', 'at'),
-    commtimeout=config.get('gammu_commtimeout', 30),
+    commtimeout=config.get('gammu_commtimeout', 40),
     init_retries=config.get('gammu_init_retries', 3),
     init_retry_delay=config.get('gammu_init_retry_delay', 5),
 )
@@ -510,10 +512,21 @@ class SmsCollection(Resource):
             ],
         }
         messages = []
+        explicit_smsc = args.get("smsc") or config.get('smsc_number', '')
+        smsc_mode = 'number' if args.get("smsc") else config.get('smsc_mode', 'auto')
         for number in sms_number.split(','):
+            clean_number = number.strip()
             for message in encodeSms(smsinfo):
-                message["SMSC"] = {'Number': args.get("smsc")} if args.get("smsc") else {'Location': 1}
-                message["Number"] = number.strip()
+                with mqtt_publisher.gammu_lock:
+                    smsc_source = apply_smsc_to_message(
+                        message,
+                        machine,
+                        configured_smsc=explicit_smsc,
+                        mode=smsc_mode,
+                        logger=logging,
+                    )
+                logging.info("Using SMSC for REST send: %s", smsc_source)
+                message["Number"] = clean_number
                 messages.append(message)
 
         try:

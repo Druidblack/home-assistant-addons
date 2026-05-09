@@ -511,6 +511,35 @@ class MQTTPublisher:
         except Exception as e:
             logger.error(f"Error handling SMS send command: {e}")
     
+    def _warn_if_local_russian_number(self, recipient):
+        """Log a hint for Russian local 8XXXXXXXXXX numbers without changing user input."""
+        digits = ''.join(ch for ch in str(recipient) if ch.isdigit())
+        if str(recipient).strip().startswith('8') and len(digits) == 11:
+            logger.warning(
+                "Recipient number '%s' starts with 8. If SendSMS returns Code 27, try international format +7%s",
+                recipient,
+                digits[1:],
+            )
+
+    def _apply_smsc_to_message(self, message):
+        """Apply configured or detected SMSC settings to one encoded SMS."""
+        from support import apply_smsc_to_message
+
+        smsc_mode = self.config.get('smsc_mode', 'auto')
+        configured_smsc = self.config.get('smsc_number', '')
+        # Reading SMSC also talks to the modem, so it must be serialized with
+        # SendSMS/GetSMSStatus/etc. to avoid concurrent AT commands.
+        with self.gammu_lock:
+            smsc_source = apply_smsc_to_message(
+                message,
+                self.gammu_machine,
+                configured_smsc=configured_smsc,
+                mode=smsc_mode,
+                logger=logger,
+            )
+        logger.info("Using SMSC: %s", smsc_source)
+        return smsc_source
+
     def _send_sms_via_gammu(self, number, text, unicode_mode=None, flash_mode=False):
         """Send SMS using gammu machine
 
@@ -552,17 +581,12 @@ class MQTTPublisher:
             messages = []
             for recipient in number.split(','):  # Split by comma for multiple recipients
                 recipient = recipient.strip()  # Remove whitespace
+                self._warn_if_local_russian_number(recipient)
                 for message in encodeSms(smsinfo):
-                    # Use same SMSC logic as REST API
-                    config_smsc = self.config.get('smsc_number', '').strip()
-                    if config_smsc:
-                        message["SMSC"] = {'Number': config_smsc}
-                        logger.info(f"Using configured SMSC: {config_smsc}")
-                    else:
-                        # Use Location 1 (same as REST API when no SMSC provided)
-                        message["SMSC"] = {'Location': 1}
-                        logger.info("Using SMSC from Location 1 (same as REST API)")
-
+                    # Prefer explicit/configured SMSC number, otherwise try to read Location 1 number
+                    # and only then fall back to the old Location 1 reference. Some modems fail
+                    # SendSMS with UNKNOWN[27] when only {'Location': 1} is supplied.
+                    self._apply_smsc_to_message(message)
                     message["Number"] = recipient
                     messages.append(message)
 
@@ -594,7 +618,7 @@ class MQTTPublisher:
             error_msg = str(e)
             # Try to extract useful error message from gammu error
             if "Code': 27" in error_msg:
-                user_error = "SMS sending failed - check SIM card, network signal or device connection"
+                user_error = "SMS sending failed (Gammu Code 27). Check SMSC number, recipient format (+7...), SIM balance/limits, signal or modem port."
             elif "Code': 38" in error_msg:
                 user_error = "Network registration failed - check SIM card and signal"
             elif "Code': 69" in error_msg:

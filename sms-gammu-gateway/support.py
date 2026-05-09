@@ -236,6 +236,66 @@ def deleteSms(machine, sms):
         raise
 
 
+def _clean_smsc_number(number):
+    """Return a usable SMSC number or an empty string."""
+    if number is None:
+        return ''
+    number = str(number).strip().strip('"').strip("'")
+    if number.lower() in ('', 'not set', 'none', 'unknown', 'null'):
+        return ''
+    return number
+
+
+def get_smsc_from_location(machine, location=1):
+    """Try to read the SMSC number stored on SIM/modem."""
+    info = machine.GetSMSC(Location=location)
+    return _clean_smsc_number(info.get('Number'))
+
+
+def apply_smsc_to_message(message, machine=None, configured_smsc='', mode='auto', logger=None):
+    """Apply SMSC settings to an encoded Gammu SMS message.
+
+    Modes:
+      - auto: configured number -> read Number from Location 1 -> Location 1 fallback
+      - number: require/use configured number
+      - location: force {'Location': 1}
+      - none: do not set SMSC field at all
+
+    Returning a short source string makes logs clear without dumping the full message.
+    """
+    mode = (mode or 'auto').strip().lower()
+    configured_smsc = _clean_smsc_number(configured_smsc)
+
+    # Start clean in case the encoded message already has an SMSC key.
+    message.pop('SMSC', None)
+
+    if mode == 'none':
+        return 'none'
+
+    if configured_smsc:
+        message['SMSC'] = {'Number': configured_smsc}
+        return f'configured number {configured_smsc}'
+
+    if mode == 'number':
+        raise ValueError('SMSC mode is "number", but smsc_number is empty')
+
+    if mode == 'auto' and machine is not None:
+        try:
+            smsc_number = get_smsc_from_location(machine, location=1)
+            if smsc_number:
+                message['SMSC'] = {'Number': smsc_number}
+                return f'number from Location 1 ({smsc_number})'
+        except Exception as e:
+            if logger:
+                logger.warning('Could not read SMSC number from Location 1, falling back to Location 1 reference: %s', e)
+
+    if mode in ('auto', 'location'):
+        message['SMSC'] = {'Location': 1}
+        return 'Location 1 reference'
+
+    raise ValueError(f'Unsupported smsc_mode: {mode}')
+
+
 def encodeSms(smsinfo):
     """Encode SMS for sending."""
     return gammu.EncodeSMS(smsinfo)
