@@ -1,10 +1,16 @@
 {
   "name": "SMS Gammu Gateway",
-  "version": "1.6.4",
+  "version": "1.6.5-stable1",
   "slug": "sms_gammu_gateway",
-  "description": "SMS gateway for USB GSM modems (SIM800L, Huawei, Quectel, etc.) with REST API, MQTT integration and Home Assistant auto-discovery. Send/receive SMS, Flash SMS support, signal and network monitoring, incoming and missed call detection, SMS cost tracking. Web UI with Swagger documentation.",
+  "description": "SMS gateway for USB GSM modems (SIM800L, Huawei, Quectel, etc.) with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with reconnectable Gammu state machine, safer polling defaults, configurable connection/commtimeout and legacy API aliases.",
   "startup": "services",
-  "arch": ["amd64", "i386", "aarch64", "armv7", "armhf"],
+  "arch": [
+    "amd64",
+    "i386",
+    "aarch64",
+    "armv7",
+    "armhf"
+  ],
   "boot": "auto",
   "panel_icon": "mdi:cellphone-message",
   "url": "https://github.com/PavelVe/home-assistant-addons/blob/main/sms-gammu-gateway/README.md",
@@ -26,9 +32,18 @@
     "sms_cost_per_message": 0.0,
     "sms_cost_currency": "CZK",
     "auto_delete_read_sms": true,
-    "missed_calls_monitoring_enabled": true,
+    "missed_calls_monitoring_enabled": false,
     "incoming_call_auto_reset_seconds": 60,
-    "voice_call_enabled": false
+    "voice_call_enabled": false,
+    "gammu_connection": "at",
+    "gammu_commtimeout": 30,
+    "gammu_init_retries": 3,
+    "gammu_init_retry_delay": 5,
+    "gammu_reinit_after_failures": 3,
+    "gammu_reinit_cooldown": 60,
+    "gammu_operation_delay": 0.3,
+    "callback_read_interval": 2,
+    "device_wait_seconds": 20
   },
   "schema": {
     "device_path": "str",
@@ -49,13 +64,38 @@
     "auto_delete_read_sms": "bool",
     "missed_calls_monitoring_enabled": "bool",
     "incoming_call_auto_reset_seconds": "int(10,300)",
-    "voice_call_enabled": "bool"
+    "voice_call_enabled": "bool",
+    "gammu_connection": "list(at|at115200|at57600|at38400|at19200|at9600)",
+    "gammu_commtimeout": "int(5,120)",
+    "gammu_init_retries": "int(1,10)",
+    "gammu_init_retry_delay": "int(1,60)",
+    "gammu_reinit_after_failures": "int(1,20)",
+    "gammu_reinit_cooldown": "int(0,3600)",
+    "gammu_operation_delay": "float(0,5)",
+    "callback_read_interval": "float(1,30)",
+    "device_wait_seconds": "int(0,300)"
   },
   "ingress": true,
   "ingress_port": 5000,
   "host_network": false,
-  "devices": ["/dev/ttyUSB0:/dev/ttyUSB0:rwm", "/dev/ttyUSB1:/dev/ttyUSB1:rwm", "/dev/ttyUSB2:/dev/ttyUSB2:rwm", "/dev/ttyUSB3:/dev/ttyUSB3:rwm", "/dev/ttyUSB4:/dev/ttyUSB4:rwm", "/dev/ttyUSB5:/dev/ttyUSB5:rwm", "/dev/ttyACM0:/dev/ttyACM0:rwm", "/dev/ttyACM1:/dev/ttyACM1:rwm", "/dev/ttyACM2:/dev/ttyACM2:rwm", "/dev/ttyACM3:/dev/ttyACM3:rwm", "/dev/ttyAMA0:/dev/ttyAMA0:rwm", "/dev/ttyAMA1:/dev/ttyAMA1:rwm", "/dev/ttyS0:/dev/ttyS0:rwm"],
-  "privileged": ["SYS_RAWIO"],
+  "devices": [
+    "/dev/ttyUSB0:/dev/ttyUSB0:rwm",
+    "/dev/ttyUSB1:/dev/ttyUSB1:rwm",
+    "/dev/ttyUSB2:/dev/ttyUSB2:rwm",
+    "/dev/ttyUSB3:/dev/ttyUSB3:rwm",
+    "/dev/ttyUSB4:/dev/ttyUSB4:rwm",
+    "/dev/ttyUSB5:/dev/ttyUSB5:rwm",
+    "/dev/ttyACM0:/dev/ttyACM0:rwm",
+    "/dev/ttyACM1:/dev/ttyACM1:rwm",
+    "/dev/ttyACM2:/dev/ttyACM2:rwm",
+    "/dev/ttyACM3:/dev/ttyACM3:rwm",
+    "/dev/ttyAMA0:/dev/ttyAMA0:rwm",
+    "/dev/ttyAMA1:/dev/ttyAMA1:rwm",
+    "/dev/ttyS0:/dev/ttyS0:rwm"
+  ],
+  "privileged": [
+    "SYS_RAWIO"
+  ],
   "udev": true,
   "init": false,
   "ports": {

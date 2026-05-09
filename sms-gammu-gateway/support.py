@@ -9,63 +9,152 @@ Licensed under Apache License 2.0
 import sys
 import os
 import logging
+import threading
+import time
 import gammu
 
 
-def init_state_machine(pin, device_path='/dev/ttyUSB0'):
-    """Initialize gammu state machine with HA add-on config"""
-    sm = gammu.StateMachine()
+class GammuStateManager:
+    """Small proxy around gammu.StateMachine with full reconnect support.
 
-    # Create gammu config dynamically
-    config_content = f"""[gammu]
-device = {device_path}
-connection = at
-commtimeout = 40
+    The rest of the add-on can keep using this object like a regular
+    gammu.StateMachine: machine.GetSignalQuality(), machine.SendSMS(), etc.
+    When reinitialize() is called, the underlying StateMachine is replaced,
+    while all existing references to this proxy stay valid.
+    """
+
+    def __init__(
+        self,
+        pin=None,
+        device_path='/dev/ttyUSB0',
+        connection='at',
+        commtimeout=30,
+        config_file='/tmp/gammu.config',
+        init_retries=1,
+        init_retry_delay=5,
+    ):
+        self.pin = pin
+        self.device_path = device_path
+        self.connection = connection or 'at'
+        self.commtimeout = int(commtimeout or 30)
+        self.config_file = config_file
+        self.init_retries = max(1, int(init_retries or 1))
+        self.init_retry_delay = max(1, int(init_retry_delay or 5))
+        self._lock = threading.RLock()
+        self._machine = None
+        self._write_config()
+        self.reinitialize(reason='initial startup')
+
+    def _write_config(self):
+        config_content = f"""[gammu]
+device = {self.device_path}
+connection = {self.connection}
+commtimeout = {self.commtimeout}
 """
+        with open(self.config_file, 'w') as f:
+            f.write(config_content)
+        logging.info(
+            "Gammu config: device=%s, connection=%s, commtimeout=%ss",
+            self.device_path,
+            self.connection,
+            self.commtimeout,
+        )
 
-    # Write config to temporary file
-    config_file = '/tmp/gammu.config'
-    with open(config_file, 'w') as f:
-        f.write(config_content)
-
-    sm.ReadConfig(Filename=config_file)
-    
-    try:
+    def _create_machine(self):
+        sm = gammu.StateMachine()
+        sm.ReadConfig(Filename=self.config_file)
         sm.Init()
-        logging.info(f"Successfully initialized gammu with device: {device_path}")
+        logging.info("Successfully initialized gammu with device: %s", self.device_path)
 
-        # Try to check security status
+        # Try to check security status. Some modems/SIM states do not support it.
         try:
             security_status = sm.GetSecurityStatus()
-            logging.info(f"SIM security status: {security_status}")
+            logging.info("SIM security status: %s", security_status)
 
             if security_status == 'PIN':
-                if pin is None or pin == '':
+                if self.pin is None or self.pin == '':
                     logging.error("PIN is required but not provided.")
                     sys.exit(1)
-                else:
-                    sm.EnterSecurityCode('PIN', pin)
-                    logging.info("PIN entered successfully")
-
+                sm.EnterSecurityCode('PIN', self.pin)
+                logging.info("PIN entered successfully")
         except Exception as e:
-            logging.warning(f"Could not check SIM security status: {e}")
+            logging.warning("Could not check SIM security status: %s", e)
 
-    except gammu.ERR_NOSIM:
-        logging.warning("SIM card not accessible, but device is connected")
-    except Exception as e:
-        logging.error(f"Error initializing device: {e}")
-        try:
-            devices = [d for d in os.listdir('/dev/') if d.startswith('tty')]
-            logging.info(f"Available devices: {', '.join([f'/dev/{d}' for d in sorted(devices)[:10]])}")
-        except:
-            pass
-        raise
-        
-    return sm
+        return sm
+
+    def reinitialize(self, reason='manual reinitialize'):
+        """Terminate the current StateMachine and create a fresh one."""
+        with self._lock:
+            logging.warning("🔄 Reinitializing Gammu state machine (%s)...", reason)
+            old_machine = self._machine
+            if old_machine is not None:
+                try:
+                    old_machine.Terminate()
+                    time.sleep(1)
+                except Exception as e:
+                    logging.debug("Ignoring Terminate() error during reinitialize: %s", e)
+
+            last_error = None
+            for attempt in range(1, self.init_retries + 1):
+                try:
+                    self._machine = self._create_machine()
+                    logging.info("✅ Gammu state machine is ready")
+                    return self._machine
+                except gammu.ERR_NOSIM:
+                    # Keep behavior compatible with the previous version: the modem can be
+                    # reachable even when SIM is temporarily inaccessible.
+                    logging.warning("SIM card not accessible, but device is connected")
+                    self._machine = old_machine
+                    return self._machine
+                except Exception as e:
+                    last_error = e
+                    logging.error(
+                        "Error initializing device on attempt %s/%s: %s",
+                        attempt,
+                        self.init_retries,
+                        e,
+                    )
+                    if attempt < self.init_retries:
+                        time.sleep(self.init_retry_delay)
+
+            try:
+                devices = [d for d in os.listdir('/dev/') if d.startswith('tty')]
+                logging.info(
+                    "Available devices: %s",
+                    ', '.join([f'/dev/{d}' for d in sorted(devices)[:30]]),
+                )
+            except Exception:
+                pass
+            raise last_error
+
+    def __getattr__(self, name):
+        machine = self._machine
+        if machine is None:
+            raise RuntimeError('Gammu state machine is not initialized')
+        return getattr(machine, name)
+
+
+def init_state_machine(
+    pin,
+    device_path='/dev/ttyUSB0',
+    connection='at',
+    commtimeout=30,
+    init_retries=1,
+    init_retry_delay=5,
+):
+    """Initialize gammu state manager with HA add-on config."""
+    return GammuStateManager(
+        pin=pin,
+        device_path=device_path,
+        connection=connection,
+        commtimeout=commtimeout,
+        init_retries=init_retries,
+        init_retry_delay=init_retry_delay,
+    )
 
 
 def retrieveAllSms(machine):
-    """Retrieve all SMS messages from SIM/device memory"""
+    """Retrieve all SMS messages from SIM/device memory."""
     try:
         status = machine.GetSMSStatus()
         allMultiPartSmsCount = status['SIMUsed'] + status['PhoneUsed'] + status['TemplatesUsed']
@@ -94,14 +183,12 @@ def retrieveAllSms(machine):
                 "Locations": [smsPart['Location'] for smsPart in sms],
             }
 
-            # Try to decode SMS - this may fail for MMS notifications or corrupted messages
+            # Try to decode SMS - this may fail for MMS notifications or corrupted messages.
             try:
                 decodedSms = gammu.DecodeSMS(sms)
-                if decodedSms == None:
-                    # DecodeSMS returned None - use raw text from SMS part
+                if decodedSms is None:
                     result["Text"] = smsPart.get('Text', '')
                 else:
-                    # Successfully decoded - concatenate all text entries
                     text = ""
                     for entry in decodedSms['Entries']:
                         if entry.get('Buffer') is not None:
@@ -109,12 +196,9 @@ def retrieveAllSms(machine):
                     result["Text"] = text if text else smsPart.get('Text', '')
 
             except UnicodeDecodeError as e:
-                # MMS notification or binary message that can't be decoded as UTF-8
-                logging.warning(f"Cannot decode SMS as UTF-8 (probably MMS notification): {e}")
-                # Try to get raw text, but handle potential binary data safely
+                logging.warning("Cannot decode SMS as UTF-8 (probably MMS notification): %s", e)
                 try:
                     raw_text = smsPart.get('Text', '')
-                    # If Text is bytes, try to decode with error handling
                     if isinstance(raw_text, bytes):
                         result["Text"] = raw_text.decode('utf-8', errors='replace')
                     else:
@@ -123,9 +207,7 @@ def retrieveAllSms(machine):
                     result["Text"] = '[MMS or binary message - cannot display]'
 
             except Exception as e:
-                # Any other decoding error (corrupted SMS, unknown format, etc.)
-                logging.warning(f"Error decoding SMS: {e}")
-                # Fallback to raw text with safe handling
+                logging.warning("Error decoding SMS: %s", e)
                 try:
                     raw_text = smsPart.get('Text', '')
                     if isinstance(raw_text, bytes):
@@ -140,46 +222,44 @@ def retrieveAllSms(machine):
         return results
 
     except Exception as e:
-        logging.error(f"Error retrieving SMS: {e}")
-        raise  # Re-raise exception so track_gammu_operation can detect failure
+        logging.error("Error retrieving SMS: %s", e)
+        raise
 
 
 def deleteSms(machine, sms):
-    """Delete SMS by location"""
+    """Delete SMS by location. Errors are re-raised so callers can track failures."""
     try:
-        list(map(lambda location: machine.DeleteSMS(Folder=0, Location=location), sms["Locations"]))
+        for location in sms.get("Locations", []):
+            machine.DeleteSMS(Folder=0, Location=location)
     except Exception as e:
-        logging.error(f"Error deleting SMS: {e}")
+        logging.error("Error deleting SMS: %s", e)
+        raise
 
 
 def encodeSms(smsinfo):
-    """Encode SMS for sending"""
+    """Encode SMS for sending."""
     return gammu.EncodeSMS(smsinfo)
 
 
 def setupCallbacks(machine, unified_callback):
     """
-    Nastaví callback pro příchozí hovory a SMS.
-    Využívá Gammu SetIncomingCall, SetIncomingSMS a jeden společný SetIncomingCallback.
+    Set callback for incoming calls and SMS.
 
     Args:
-        machine: Gammu state machine
-        unified_callback: Callback funkce pro všechny události (sm, event_type, data)
-                         event_type může být 'Call' nebo 'SMS'
+        machine: Gammu state machine or GammuStateManager proxy
+        unified_callback: callback function for all events (sm, event_type, data)
 
-    Returns: {'calls': bool, 'sms': bool} - co se podařilo nastavit
+    Returns: {'calls': bool, 'sms': bool}
     """
     result = {'calls': False, 'sms': False}
 
-    # Nastav společný callback pro všechny události
     try:
         machine.SetIncomingCallback(unified_callback)
         logging.info("📱 Unified callback: SetIncomingCallback registered")
     except Exception as e:
-        logging.error(f"📱 SetIncomingCallback failed: {type(e).__name__}: {e}")
+        logging.error("📱 SetIncomingCallback failed: %s: %s", type(e).__name__, e)
         return result
 
-    # Povol Call notifikace (bez parametru podle dokumentace)
     try:
         machine.SetIncomingCall()
         result['calls'] = True
@@ -187,9 +267,8 @@ def setupCallbacks(machine, unified_callback):
     except gammu.ERR_NOTSUPPORTED:
         logging.warning("📞 SetIncomingCall: Not supported by this modem")
     except Exception as e:
-        logging.error(f"📞 SetIncomingCall failed: {type(e).__name__}: {e}")
+        logging.error("📞 SetIncomingCall failed: %s: %s", type(e).__name__, e)
 
-    # Povol SMS notifikace (bez parametru podle dokumentace)
     try:
         machine.SetIncomingSMS()
         result['sms'] = True
@@ -197,6 +276,6 @@ def setupCallbacks(machine, unified_callback):
     except gammu.ERR_NOTSUPPORTED:
         logging.warning("📨 SetIncomingSMS: Not supported by this modem")
     except Exception as e:
-        logging.error(f"📨 SetIncomingSMS failed: {type(e).__name__}: {e}")
+        logging.error("📨 SetIncomingSMS failed: %s: %s", type(e).__name__, e)
 
     return result

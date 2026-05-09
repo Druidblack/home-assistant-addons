@@ -11,7 +11,6 @@ import os
 from datetime import datetime
 from typing import Optional, Dict, Any
 import paho.mqtt.client as mqtt
-import concurrent.futures
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +212,7 @@ class MQTTPublisher:
         self.topic_prefix = config.get('mqtt_topic_prefix', 'homeassistant/sensor/sms_gateway')
         self.availability_topic = f"{self.topic_prefix}/availability"  # Shared availability for all entities
         self.gammu_machine = None  # Will be set externally
-        self.gammu_lock = threading.Lock()  # Serialize all Gammu operations to prevent race conditions
+        self.gammu_lock = threading.RLock()  # Serialize all Gammu operations and allow nested reinit calls
         self.current_phone_number = ""  # Current phone number from text input
         self.current_message_text = ""  # Current message text from text input
         self.device_tracker = DeviceConnectivityTracker()  # USB device connectivity tracking
@@ -232,6 +231,13 @@ class MQTTPublisher:
         self._outgoing_call_active = False
         self._call_active_until = None  # Timestamp when call should be over
         self._post_call_recovery_until = None  # Post-call recovery period (ReadDevice only)
+
+        # Gammu recovery tuning
+        self.gammu_reinit_after_failures = int(config.get('gammu_reinit_after_failures', 3) or 3)
+        self.gammu_reinit_cooldown = int(config.get('gammu_reinit_cooldown', 60) or 60)
+        self.gammu_operation_delay = float(config.get('gammu_operation_delay', 0.3) or 0.3)
+        self.callback_read_interval = float(config.get('callback_read_interval', 2) or 2)
+        self._last_reinit_attempt = 0.0
 
         # SMS callback (faster delivery, polling as fallback)
         self.sms_callback_enabled = False
@@ -1595,23 +1601,12 @@ class MQTTPublisher:
                         self._post_call_recovery_until = None
                         logger.info("🔄 Post-call recovery: re-initializing modem connection...")
                         try:
-                            with self.gammu_lock:
-                                gammu_machine.Terminate()
-                                time.sleep(2)
-                                gammu_machine.Init()
-                            logger.info("✅ Modem connection re-initialized")
-                            # Re-register callbacks (lost after Terminate+Init)
-                            from support import setupCallbacks
-                            result = setupCallbacks(gammu_machine, self._handle_gammu_event)
-                            if result.get('calls'):
-                                logger.info("📞 Call callback: RE-ENABLED after recovery")
-                            if result.get('sms'):
-                                logger.info("📨 SMS callback: RE-ENABLED after recovery")
+                            self.reinitialize_gammu("post-call recovery", force=True)
                             logger.info("✅ Post-call recovery complete, resuming normal operations")
                         except Exception as e:
                             logger.warning(f"⚠️ Post-call recovery failed: {e}, resuming anyway")
 
-                    time.sleep(1)
+                    time.sleep(self.callback_read_interval)
                 logger.info("🔄 ReadDevice loop stopped")
 
             self._read_device_thread = threading.Thread(
@@ -1646,45 +1641,115 @@ class MQTTPublisher:
             self._post_call_recovery_until = None
         return False
 
+    def reinitialize_gammu(self, reason="automatic recovery", force=False):
+        """Fully reinitialize Gammu connection and re-register callbacks when needed."""
+        now = time.time()
+        if not force and (now - self._last_reinit_attempt) < self.gammu_reinit_cooldown:
+            remaining = int(self.gammu_reinit_cooldown - (now - self._last_reinit_attempt))
+            logger.warning(f"⏳ Skipping Gammu reinit ({reason}); cooldown {remaining}s remaining")
+            return False
+
+        self._last_reinit_attempt = now
+        with self.gammu_lock:
+            if not self.gammu_machine:
+                logger.warning("Cannot reinitialize Gammu: machine is not set")
+                return False
+
+            logger.warning(f"🔄 Reinitializing Gammu connection: {reason}")
+            if hasattr(self.gammu_machine, 'reinitialize'):
+                self.gammu_machine.reinitialize(reason=reason)
+            else:
+                # Compatibility fallback for a raw gammu.StateMachine.
+                try:
+                    self.gammu_machine.Terminate()
+                    time.sleep(1)
+                except Exception as e:
+                    logger.debug(f"Ignoring Terminate() error during reinit: {e}")
+                self.gammu_machine.Init()
+
+            # Callback registrations are lost after Terminate/Init or StateMachine replacement.
+            if self.call_monitoring_enabled or self.sms_callback_enabled:
+                try:
+                    from support import setupCallbacks
+                    result = setupCallbacks(self.gammu_machine, self._handle_gammu_event)
+                    self.call_monitoring_enabled = bool(result.get('calls'))
+                    self.sms_callback_enabled = bool(result.get('sms'))
+                    logger.info(
+                        "✅ Gammu callbacks re-registered after reinit (calls=%s, sms=%s)",
+                        self.call_monitoring_enabled,
+                        self.sms_callback_enabled,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not re-register Gammu callbacks after reinit: {e}")
+
+            # A successful reinit should make the next health operation decide online/offline.
+            logger.info("✅ Gammu reinitialization completed")
+            return True
+
+    def _maybe_reinitialize_after_failure(self, operation_name, error):
+        """Try full reconnect after repeated modem failures."""
+        failures = self.device_tracker.consecutive_failures
+        if failures < self.gammu_reinit_after_failures:
+            return
+
+        # Do not reconnect for user/configuration errors that are unlikely to be fixed by reinit.
+        error_msg = str(error)
+        non_recoverable_fragments = [
+            "Code': 69",  # ERR_GETTING_SMSC / SMSC not configured
+            "SMSC number not found",
+            "PIN is required",
+            "authentication",
+        ]
+        if any(fragment in error_msg for fragment in non_recoverable_fragments):
+            logger.warning(
+                "Not reinitializing after '%s': error looks like configuration/SIM issue: %s",
+                operation_name,
+                error_msg,
+            )
+            return
+
+        try:
+            self.reinitialize_gammu(
+                f"{failures} consecutive Gammu failures; last operation={operation_name}",
+                force=False,
+            )
+        except Exception as reinit_err:
+            logger.error(f"❌ Gammu reinitialization failed: {reinit_err}")
+
     def track_gammu_operation(self, operation_name, gammu_function, *args, **kwargs):
-        """Execute gammu operation with connectivity tracking, thread safety, and Python-level timeout"""
-        # Skip operations during active outgoing call (modem is busy)
+        """Execute gammu operation with connectivity tracking and serialized modem access.
+
+        The previous implementation used ThreadPoolExecutor.result(timeout=60), but that
+        was not a reliable watchdog because the executor waited for the stuck worker when
+        leaving the context manager. We rely on Gammu's commtimeout and use full reinit
+        after repeated errors instead of creating unkillable Python threads.
+        """
         if self._is_call_active() and operation_name != "DialVoice":
             logger.debug(f"⏸️ Skipping '{operation_name}' - outgoing call in progress")
             raise Exception("Outgoing call in progress, modem busy")
-        # Skip operations during post-call recovery (ReadDevice flushes NO CARRIER URC)
+
         if self._is_post_call_recovery() and operation_name != "Reset":
             logger.debug(f"⏸️ Skipping '{operation_name}' - post-call recovery in progress")
             raise Exception("Post-call recovery in progress, modem busy")
-        # Use lock to serialize all Gammu operations (prevent race conditions on serial port)
+
         with self.gammu_lock:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(gammu_function, *args, **kwargs)
-                try:
-                    # Python-level timeout (60s) as second defense layer
-                    # Primary defense is Gammu commtimeout=40s in config
-                    result = future.result(timeout=60)
-                    self.device_tracker.record_success()
-                    self.publish_device_status()
-                    logger.debug(f"✅ Gammu operation '{operation_name}' succeeded")
+            try:
+                result = gammu_function(*args, **kwargs)
+                self.device_tracker.record_success()
+                self.publish_device_status()
+                logger.debug(f"✅ Gammu operation '{operation_name}' succeeded")
 
-                    # Small delay after each operation to let modem "breathe"
-                    # Prevents buffer overflow on modems like Huawei E1750
-                    time.sleep(0.3)
+                if self.gammu_operation_delay > 0:
+                    time.sleep(self.gammu_operation_delay)
 
-                    return result
-                except concurrent.futures.TimeoutError:
-                    # Operation timed out at Python level
-                    self.device_tracker.record_failure(f"{operation_name}: Python timeout (60s)")
-                    self.publish_device_status()
-                    logger.error(f"⏱️ Gammu operation '{operation_name}' timed out after 60s")
-                    raise TimeoutError(f"Gammu operation '{operation_name}' timed out after 60s")
-                except Exception as e:
-                    # All other errors (including Gammu commtimeout errors)
-                    self.device_tracker.record_failure(f"{operation_name}: {str(e)}")
-                    self.publish_device_status()
-                    raise
-    
+                return result
+            except Exception as e:
+                self.device_tracker.record_failure(f"{operation_name}: {str(e)}")
+                self.publish_device_status()
+                logger.warning(f"❌ Gammu operation '{operation_name}' failed: {e}")
+                self._maybe_reinitialize_after_failure(operation_name, e)
+                raise
+
     def _publish_initial_states(self):
         """Publish initial sensor states on startup"""
         if self.connected:
@@ -1837,9 +1902,8 @@ class MQTTPublisher:
                     if failures == 2 or (failures > 2 and failures % 5 == 0):
                         logger.warning(f"🔄 Attempting modem soft reset after {failures} failures...")
                         try:
-                            # Soft reset: AT+CFUN=1,1 (restart modem software, keep SIM state)
-                            self.track_gammu_operation("Reset", gammu_machine.Reset, False)
-                            logger.info("✅ Modem soft reset completed, waiting 5s for recovery...")
+                            self.reinitialize_gammu(f"SMS monitor recovery after {failures} failures", force=False)
+                            logger.info("✅ Modem reinitialization requested, waiting 5s for recovery...")
                             time.sleep(5)
                         except Exception as reset_err:
                             logger.error(f"❌ Modem soft reset failed: {reset_err}")

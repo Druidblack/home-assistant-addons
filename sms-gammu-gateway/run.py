@@ -103,7 +103,18 @@ def load_ha_config():
             'sms_check_interval': 60,
             'sms_cost_per_message': 0.0,
             'sms_cost_currency': 'CZK',
-            'auto_delete_read_sms': False
+            'auto_delete_read_sms': False,
+            'missed_calls_monitoring_enabled': False,
+            'incoming_call_auto_reset_seconds': 60,
+            'voice_call_enabled': False,
+            'gammu_connection': 'at',
+            'gammu_commtimeout': 30,
+            'gammu_init_retries': 3,
+            'gammu_init_retry_delay': 5,
+            'gammu_reinit_after_failures': 3,
+            'gammu_reinit_cooldown': 60,
+            'gammu_operation_delay': 0.3,
+            'callback_read_interval': 2
         }
 
 # Load version and configuration
@@ -126,7 +137,16 @@ if mqtt_publisher.connected:
     logging.info("📡 Published initial OFFLINE status on startup")
 
 # Now initialize gammu state machine (this may fail if modem not connected)
-machine = init_state_machine(pin, device_path)
+# The returned object is a reconnectable proxy, so all existing references remain valid
+# after full Gammu reinitialization.
+machine = init_state_machine(
+    pin,
+    device_path,
+    connection=config.get('gammu_connection', 'at'),
+    commtimeout=config.get('gammu_commtimeout', 30),
+    init_retries=config.get('gammu_init_retries', 3),
+    init_retry_delay=config.get('gammu_init_retry_delay', 5),
+)
 
 # Set gammu machine for MQTT SMS sending
 mqtt_publisher.set_gammu_machine(machine)
@@ -684,9 +704,12 @@ class Reset(Resource):
     @ns_status.doc('modem_reset')
     @ns_status.marshal_with(reset_response)
     def get(self):
-        """Reset GSM modem (useful for stuck connections)"""
-        mqtt_publisher.track_gammu_operation("Reset", machine.Reset, False)
-        return {"status": 200, "message": "Reset done"}, 200
+        """Reinitialize GSM modem connection (useful for stuck connections)"""
+        try:
+            mqtt_publisher.reinitialize_gammu("manual /status/reset request", force=True)
+            return {"status": 200, "message": "Gammu connection reinitialized"}, 200
+        except Exception as e:
+            api.abort(503, f"Failed to reinitialize modem: {str(e)}")
 
 @ns_calls.route('/dial')
 @ns_calls.doc('call_operations')
@@ -742,6 +765,43 @@ class CallHangup(Resource):
             return {"status": 403, "message": "Voice calls are disabled in addon configuration"}, 403
 
         return {"status": 200, "message": "Hangup not supported on this modem. Call ends via network timeout (~40s)."}, 200
+
+
+# Legacy aliases for compatibility with the original pajikos/sms-gammu-gateway API
+# and custom_components/gammu_gateway versions that call /signal, /network, /getsms, /reset.
+@app.route('/signal')
+def legacy_signal():
+    signal_data = mqtt_publisher.track_gammu_operation("GetSignalQuality", machine.GetSignalQuality)
+    mqtt_publisher.publish_signal_strength(signal_data)
+    return signal_data
+
+@app.route('/network')
+def legacy_network():
+    network = mqtt_publisher.track_gammu_operation("GetNetworkInfo", machine.GetNetworkInfo)
+    network["NetworkName"] = GSMNetworks.get(network.get("NetworkCode", ""), 'Unknown')
+    mqtt_publisher.publish_network_info(network)
+    return network
+
+@app.route('/getsms')
+@auth.login_required
+def legacy_getsms():
+    allSms = mqtt_publisher.track_gammu_operation("retrieveAllSms", retrieveAllSms, machine)
+    sms = {"Date": "", "Number": "", "State": "", "Text": ""}
+    if len(allSms) > 0:
+        sms = allSms[0]
+        mqtt_publisher.track_gammu_operation("deleteSms", deleteSms, machine, sms)
+        sms.pop("Locations", None)
+        if sms.get("Text"):
+            mqtt_publisher.publish_sms_received(sms)
+    return sms
+
+@app.route('/reset')
+def legacy_reset():
+    try:
+        mqtt_publisher.reinitialize_gammu("manual /reset request", force=True)
+        return {"status": 200, "message": "Gammu connection reinitialized"}
+    except Exception as e:
+        return {"status": 503, "message": f"Failed to reinitialize modem: {str(e)}"}, 503
 
 def get_external_port():
     """Get the external port from HA Supervisor API."""
