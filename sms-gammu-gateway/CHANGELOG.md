@@ -1,3 +1,9 @@
+## 1.6.5-stable6
+
+- Optimized `network_wake` recovery for Huawei modems by replacing fixed radio-cycle sleeps with adaptive network-registration polling.
+- Added configurable `sms_network_wake_*` timing options.
+- Reduced default AT command delay for faster recovery cycles.
+
 # Changelog
 
 All notable changes to this project will be documented in this file.

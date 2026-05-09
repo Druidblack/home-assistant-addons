@@ -14,6 +14,7 @@ import time
 import multiprocessing
 import queue
 import uuid
+import re
 import gammu
 
 
@@ -75,6 +76,68 @@ def _read_serial_response(ser, timeout):
     return ''.join(chunks).strip()
 
 
+def _registration_status_from_response(response):
+    """Return GSM/LTE registration status from +CREG/+CGREG response text.
+
+    Registered statuses are 1 (home) and 5 (roaming). Responses can look like
+    '+CREG: 1' or '+CREG: 2,1,"LAC","CID"'.
+    """
+    for raw_line in str(response or '').replace('\r', '\n').split('\n'):
+        line = raw_line.strip()
+        if not (line.startswith('+CREG:') or line.startswith('+CGREG:')):
+            continue
+        numbers = re.findall(r'\d+', line.split(':', 1)[1])
+        if not numbers:
+            continue
+        # Query responses commonly include <n>,<stat>; unsolicited URCs can be <stat>.
+        status = numbers[1] if len(numbers) >= 2 else numbers[0]
+        if status in ('1', '5'):
+            return status
+    return None
+
+
+def _wait_for_network_registration(ser, timeout, interval=1.0):
+    """Poll +CREG? until the modem is registered or timeout expires.
+
+    This replaces the old fixed 20 second sleep after AT+CFUN=1. Huawei sticks
+    often re-register earlier, and when they do we can continue immediately.
+    """
+    timeout = max(0.0, float(timeout or 0))
+    if timeout <= 0:
+        logging.info("📟 Network registration wait disabled")
+        return False, ''
+
+    deadline = time.time() + timeout
+    last_response = ''
+    interval = max(0.2, float(interval or 1.0))
+    logging.info("📟 Waiting for network registration up to %.1fs", timeout)
+
+    while time.time() < deadline:
+        remaining = max(0.5, min(2.0, deadline - time.time()))
+        try:
+            ser.write(b'AT+CREG?\r')
+            ser.flush()
+            response = _read_serial_response(ser, remaining)
+        except Exception as exc:
+            logging.warning("📟 Network registration poll failed: %s", exc)
+            response = ''
+
+        last_response = response or last_response
+        if response:
+            compact = ' | '.join(line.strip() for line in response.replace('\r', '\n').split('\n') if line.strip())
+            logging.info("📟 AT < %s", compact[:500])
+            status = _registration_status_from_response(response)
+            if status in ('1', '5'):
+                logging.info("📟 Network registered: CREG/CGREG status=%s", status)
+                return True, response
+
+        if time.time() < deadline:
+            time.sleep(min(interval, max(0.0, deadline - time.time())))
+
+    logging.warning("📟 Network registration wait timed out after %.1fs; continuing", timeout)
+    return False, last_response
+
+
 def _run_raw_at_sequence(device_path, connection, commands, at_timeout=5, command_delay=0.5, reason='raw AT sequence'):
     """Run raw AT commands outside python-gammu.
 
@@ -97,36 +160,55 @@ def _run_raw_at_sequence(device_path, connection, commands, at_timeout=5, comman
             pass
 
         for item in commands:
-            if isinstance(item, dict):
-                sleep_for = float(item.get('sleep', 0) or 0)
-                if sleep_for > 0:
-                    logging.info("📟 Raw AT recovery sleep %.1fs", sleep_for)
-                    time.sleep(sleep_for)
-                continue
+            item_timeout = at_timeout
+            item_delay = command_delay
 
-            command = str(item).strip()
+            if isinstance(item, dict):
+                if 'sleep' in item:
+                    sleep_for = float(item.get('sleep', 0) or 0)
+                    if sleep_for > 0:
+                        logging.info("📟 Raw AT recovery sleep %.1fs", sleep_for)
+                        time.sleep(sleep_for)
+                    continue
+                if 'wait_network' in item:
+                    wait_for = float(item.get('wait_network', 0) or 0)
+                    interval = float(item.get('interval', 1.0) or 1.0)
+                    registered, response = _wait_for_network_registration(ser, wait_for, interval)
+                    results.append({'command': 'WAIT_NETWORK', 'registered': registered, 'response': response})
+                    continue
+                command = str(item.get('cmd') or item.get('command') or '').strip()
+                item_timeout = float(item.get('timeout', at_timeout) or at_timeout)
+                item_delay = float(item.get('delay', command_delay) or 0)
+            else:
+                command = str(item).strip()
+
             if not command:
                 continue
             wire = (command + '\r').encode('ascii', errors='ignore')
             logging.info("📟 AT > %s", command)
             ser.write(wire)
             ser.flush()
-            response = _read_serial_response(ser, at_timeout)
+            response = _read_serial_response(ser, item_timeout)
             if response:
                 compact = ' | '.join(line.strip() for line in response.replace('\r', '\n').split('\n') if line.strip())
                 logging.info("📟 AT < %s", compact[:500])
             else:
                 logging.info("📟 AT < <no response>")
             results.append({'command': command, 'response': response})
-            if command_delay > 0:
-                time.sleep(command_delay)
+            if item_delay > 0:
+                time.sleep(item_delay)
 
     logging.warning("✅ Raw AT recovery completed (%s)", reason)
     return results
 
 
-def build_sms_wake_commands(mode):
-    """Build conservative AT recovery sequences for stuck MT-SMS delivery."""
+def build_sms_wake_commands(mode, cfun0_timeout=2, off_delay=2.0, register_timeout=15, register_poll_interval=1.0):
+    """Build AT recovery sequences for stuck MT-SMS delivery.
+
+    network_wake is intentionally adaptive: it no longer sleeps a fixed 20s after
+    AT+CFUN=1. Instead it waits only until the modem reports network registration
+    or until register_timeout expires.
+    """
     mode = str(mode or '').lower()
     sms_init = [
         'AT',
@@ -153,13 +235,11 @@ def build_sms_wake_commands(mode):
             'ATE0',
             'AT+CMEE=2',
             'AT+CFUN?',
-            'AT+CFUN=0',
-            {'sleep': 8},
-            'AT+CFUN=1',
-            {'sleep': 20},
+            {'cmd': 'AT+CFUN=0', 'timeout': float(cfun0_timeout or 2), 'delay': 0},
+            {'sleep': float(off_delay or 0)},
+            {'cmd': 'AT+CFUN=1', 'timeout': 3, 'delay': 0},
+            {'wait_network': int(register_timeout or 0), 'interval': float(register_poll_interval or 1.0)},
             'AT+CPIN?',
-            'AT+CREG?',
-            'AT+CSQ',
         ] + sms_init[4:]
     return sms_init
 

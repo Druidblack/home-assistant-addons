@@ -1,8 +1,8 @@
 {
   "name": "SMS Gammu Gateway",
-  "version": "1.6.5-stable5",
+  "version": "1.6.5-stable6",
   "slug": "sms_gammu_gateway",
-  "description": "SMS gateway for USB GSM modems with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with isolated Gammu worker process, hard operation timeout, safer polling defaults, raw AT SMS wake recovery for Huawei post-call delivery issues and legacy API aliases.",
+  "description": "SMS gateway for USB GSM modems with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with isolated Gammu worker process, hard operation timeout, safer polling defaults, raw AT SMS wake recovery and faster adaptive network wake for Huawei post-call SMS delivery issues.",
   "startup": "services",
   "arch": [
     "amd64",
@@ -52,7 +52,11 @@
     "sms_burst_after_send_seconds": 120,
     "sms_burst_interval": 10,
     "sms_wake_at_timeout": 5,
-    "sms_wake_command_delay": 0.5
+    "sms_wake_command_delay": 0.2,
+    "sms_network_wake_cfun0_timeout": 2,
+    "sms_network_wake_off_delay": 2.0,
+    "sms_network_wake_register_timeout": 15,
+    "sms_network_wake_register_poll_interval": 1.0
   },
   "schema": {
     "device_path": "str",
@@ -91,7 +95,11 @@
     "sms_burst_after_send_seconds": "int(0,1800)",
     "sms_burst_interval": "int(1,300)",
     "sms_wake_at_timeout": "int(1,30)",
-    "sms_wake_command_delay": "float(0,10)"
+    "sms_wake_command_delay": "float(0,10)",
+    "sms_network_wake_cfun0_timeout": "float(0.5,30)",
+    "sms_network_wake_off_delay": "float(0,30)",
+    "sms_network_wake_register_timeout": "int(0,120)",
+    "sms_network_wake_register_poll_interval": "float(0.2,10)"
   },
   "ingress": true,
   "ingress_port": 5000,

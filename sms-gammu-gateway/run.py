@@ -121,7 +121,11 @@ def load_ha_config():
             'sms_recovery_interval': 300,
             'sms_recovery_delay': 5,
             'sms_wake_at_timeout': 5,
-            'sms_wake_command_delay': 0.5,
+            'sms_wake_command_delay': 0.2,
+            'sms_network_wake_cfun0_timeout': 2,
+            'sms_network_wake_off_delay': 2.0,
+            'sms_network_wake_register_timeout': 15,
+            'sms_network_wake_register_poll_interval': 1.0,
             'sms_burst_after_send_seconds': 120,
             'sms_burst_interval': 10
         }

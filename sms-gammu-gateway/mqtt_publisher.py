@@ -247,7 +247,11 @@ class MQTTPublisher:
         self.sms_recovery_interval = int(config.get('sms_recovery_interval', 300) or 0)
         self.sms_recovery_delay = int(config.get('sms_recovery_delay', 5) or 0)
         self.sms_wake_at_timeout = int(config.get('sms_wake_at_timeout', 5) or 5)
-        self.sms_wake_command_delay = float(config.get('sms_wake_command_delay', 0.5) or 0.5)
+        self.sms_wake_command_delay = float(config.get('sms_wake_command_delay', 0.2) or 0.2)
+        self.sms_network_wake_cfun0_timeout = float(config.get('sms_network_wake_cfun0_timeout', 2) or 2)
+        self.sms_network_wake_off_delay = float(config.get('sms_network_wake_off_delay', 2.0) or 2.0)
+        self.sms_network_wake_register_timeout = int(config.get('sms_network_wake_register_timeout', 15) or 0)
+        self.sms_network_wake_register_poll_interval = float(config.get('sms_network_wake_register_poll_interval', 1.0) or 1.0)
         self.sms_burst_after_send_seconds = int(config.get('sms_burst_after_send_seconds', 120) or 0)
         self.sms_burst_interval = int(config.get('sms_burst_interval', 10) or 10)
         self._last_sms_recovery = time.time()
@@ -1757,7 +1761,13 @@ class MQTTPublisher:
         elif mode in ('at_wake', 'cnmi', 'sms_init', 'network_wake', 'cfun', 'radio'):
             try:
                 from support import build_sms_wake_commands
-                commands = build_sms_wake_commands(mode)
+                commands = build_sms_wake_commands(
+                    mode,
+                    cfun0_timeout=self.sms_network_wake_cfun0_timeout,
+                    off_delay=self.sms_network_wake_off_delay,
+                    register_timeout=self.sms_network_wake_register_timeout,
+                    register_poll_interval=self.sms_network_wake_register_poll_interval,
+                )
                 self.track_gammu_operation(
                     "RawATSequence",
                     self.gammu_machine.RawATSequence,
