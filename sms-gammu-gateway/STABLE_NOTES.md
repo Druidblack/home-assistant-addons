@@ -52,12 +52,3 @@ auto_delete_read_sms: true
 If the modem is unstable with `at`, try `at115200`.
 
 For SIMCom/Quectel multi-interface modems, avoid GNSS/NMEA/diagnostic interfaces. Use the actual AT/SMS port.
-
-
-## 1.6.5-stable2
-
-- Restored default `gammu_commtimeout` to 40 seconds to match the previous add-on behavior.
-- Added visible `smsc_number` and `smsc_mode` options.
-- Sending now prefers an explicit/configured SMSC number, then the number read from SMSC Location 1, then the legacy Location 1 reference.
-- Added compatibility helper so REST and MQTT sends use the same SMSC selection logic.
-- Added a warning when a Russian recipient number is entered as `8XXXXXXXXXX`; this is not auto-converted, but `+7XXXXXXXXXX` can be more reliable on some modem/operator combinations.
