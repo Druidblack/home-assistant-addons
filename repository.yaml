@@ -1,4 +1,4 @@
 # https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
-name: Pavel's Home Assistant add-on repository
-url: 'https://github.com/PavelVe/home-assistant-addons'
+name: Pavel's Home Assistant add-on repository fork
+url: 'https://github.com/Druidblack/home-assistant-addons'
 maintainer: PavelVe <vejnar.p@gmail.com>
