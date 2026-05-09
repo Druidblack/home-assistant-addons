@@ -1556,6 +1556,13 @@ class MQTTPublisher:
         Returns:
             True pokud aspoň jeden callback funguje, False jinak
         """
+        if getattr(gammu_machine, 'is_process_worker', False):
+            logger.warning(
+                "📞 Callback/ReadDevice monitoring is disabled with isolated Gammu process worker; "
+                "using SMS polling only for stability"
+            )
+            return False
+
         from support import setupCallbacks
 
         # Setup unified callbacku pro hovory i SMS

@@ -1,8 +1,8 @@
 {
   "name": "SMS Gammu Gateway",
-  "version": "1.6.5-stable1",
+  "version": "1.6.5-stable3",
   "slug": "sms_gammu_gateway",
-  "description": "SMS gateway for USB GSM modems (SIM800L, Huawei, Quectel, etc.) with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with reconnectable Gammu state machine, safer polling defaults, configurable connection/commtimeout and legacy API aliases.",
+  "description": "SMS gateway for USB GSM modems with REST API, MQTT integration and Home Assistant auto-discovery. Stable build with isolated Gammu worker process, hard operation timeout, safer polling defaults, configurable connection/commtimeout and legacy API aliases.",
   "startup": "services",
   "arch": [
     "amd64",
@@ -43,7 +43,9 @@
     "gammu_reinit_cooldown": 60,
     "gammu_operation_delay": 0.3,
     "callback_read_interval": 2,
-    "device_wait_seconds": 20
+    "device_wait_seconds": 20,
+    "gammu_process_worker": true,
+    "gammu_operation_timeout": 90
   },
   "schema": {
     "device_path": "str",
@@ -73,7 +75,9 @@
     "gammu_reinit_cooldown": "int(0,3600)",
     "gammu_operation_delay": "float(0,5)",
     "callback_read_interval": "float(1,30)",
-    "device_wait_seconds": "int(0,300)"
+    "device_wait_seconds": "int(0,300)",
+    "gammu_process_worker": "bool",
+    "gammu_operation_timeout": "int(30,600)"
   },
   "ingress": true,
   "ingress_port": 5000,

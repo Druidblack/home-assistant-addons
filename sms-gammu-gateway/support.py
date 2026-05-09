@@ -11,7 +11,287 @@ import os
 import logging
 import threading
 import time
+import multiprocessing
+import queue
+import uuid
 import gammu
+
+
+
+
+class GammuWorkerError(Exception):
+    """Error returned by the isolated Gammu worker process."""
+
+
+class GammuOperationTimeout(TimeoutError):
+    """Raised when a Gammu operation does not finish in time."""
+
+
+def _write_gammu_config(config_file, device_path, connection, commtimeout):
+    config_content = f"""[gammu]
+device = {device_path}
+connection = {connection}
+commtimeout = {commtimeout}
+"""
+    with open(config_file, 'w') as f:
+        f.write(config_content)
+
+
+def _create_raw_state_machine(settings):
+    """Create and initialize a raw gammu.StateMachine inside the owning process."""
+    pin = settings.get('pin')
+    device_path = settings.get('device_path', '/dev/ttyUSB0')
+    connection = settings.get('connection', 'at') or 'at'
+    commtimeout = int(settings.get('commtimeout', 30) or 30)
+    config_file = settings.get('config_file', '/tmp/gammu_worker.config')
+
+    _write_gammu_config(config_file, device_path, connection, commtimeout)
+    sm = gammu.StateMachine()
+    sm.ReadConfig(Filename=config_file)
+    sm.Init()
+
+    try:
+        security_status = sm.GetSecurityStatus()
+        logging.info("SIM security status: %s", security_status)
+        if security_status == 'PIN':
+            if not pin:
+                raise RuntimeError("PIN is required but not provided")
+            sm.EnterSecurityCode('PIN', pin)
+            logging.info("PIN entered successfully")
+    except Exception as e:
+        # Keep compatibility with the previous add-on behavior: many modems do not
+        # support security status queries reliably, but can still send/read SMS.
+        logging.warning("Could not check SIM security status: %s", e)
+
+    return sm
+
+
+def _gammu_process_worker(settings, request_queue, response_queue):
+    """Own all python-gammu calls in a child process.
+
+    This is intentionally small and boring: one StateMachine, one command at a
+    time. If libgammu blocks forever in a C/serial call, the parent can kill this
+    whole process and start a fresh one without freezing Flask/MQTT threads.
+    """
+    machine = None
+
+    def ensure_machine():
+        nonlocal machine
+        if machine is None:
+            machine = _create_raw_state_machine(settings)
+            logging.info(
+                "Successfully initialized isolated gammu worker with device: %s",
+                settings.get('device_path', '/dev/ttyUSB0'),
+            )
+        return machine
+
+    def terminate_machine():
+        nonlocal machine
+        if machine is not None:
+            try:
+                machine.Terminate()
+            except Exception as e:
+                logging.debug("Ignoring Gammu Terminate() error in worker: %s", e)
+            machine = None
+
+    while True:
+        request_id = None
+        try:
+            request = request_queue.get()
+            request_id = request.get('id')
+            operation = request.get('operation')
+            args = request.get('args', ())
+            kwargs = request.get('kwargs', {})
+
+            if operation in ('_stop', 'Terminate'):
+                terminate_machine()
+                response_queue.put({'id': request_id, 'ok': True, 'result': True})
+                break
+
+            if operation == '_ping':
+                ensure_machine()
+                response_queue.put({'id': request_id, 'ok': True, 'result': True})
+                continue
+
+            if operation == 'reinitialize':
+                terminate_machine()
+                time.sleep(1)
+                ensure_machine()
+                response_queue.put({'id': request_id, 'ok': True, 'result': True})
+                continue
+
+            sm = ensure_machine()
+            result = getattr(sm, operation)(*args, **kwargs)
+            response_queue.put({'id': request_id, 'ok': True, 'result': result})
+
+        except Exception as e:
+            # Do not try to pickle gammu exception objects directly; pickle a
+            # compact error payload instead.
+            try:
+                response_queue.put({
+                    'id': request_id,
+                    'ok': False,
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'error_repr': repr(e),
+                })
+            except Exception:
+                pass
+
+
+class GammuProcessClient:
+    """Process-isolated proxy compatible with gammu.StateMachine method calls."""
+
+    is_process_worker = True
+
+    def __init__(
+        self,
+        pin=None,
+        device_path='/dev/ttyUSB0',
+        connection='at',
+        commtimeout=30,
+        operation_timeout=90,
+        config_file='/tmp/gammu_worker.config',
+    ):
+        self.pin = pin
+        self.device_path = device_path
+        self.connection = connection or 'at'
+        self.commtimeout = int(commtimeout or 30)
+        self.operation_timeout = int(operation_timeout or 90)
+        self.config_file = config_file
+        self._manager_lock = threading.RLock()
+        self._ctx = multiprocessing.get_context('fork') if 'fork' in multiprocessing.get_all_start_methods() else multiprocessing.get_context()
+        self._request_queue = None
+        self._response_queue = None
+        self._process = None
+        self._start_worker(reason='initial startup')
+
+    def _settings(self):
+        return {
+            'pin': self.pin,
+            'device_path': self.device_path,
+            'connection': self.connection,
+            'commtimeout': self.commtimeout,
+            'config_file': self.config_file,
+        }
+
+    def _start_worker(self, reason='restart'):
+        with self._manager_lock:
+            self._stop_worker(kill=True)
+            self._request_queue = self._ctx.Queue()
+            self._response_queue = self._ctx.Queue()
+            self._process = self._ctx.Process(
+                target=_gammu_process_worker,
+                args=(self._settings(), self._request_queue, self._response_queue),
+                daemon=True,
+                name='GammuProcessWorker',
+            )
+            self._process.start()
+            logging.warning(
+                "🔄 Started isolated Gammu worker process pid=%s (%s), timeout=%ss, device=%s, connection=%s",
+                self._process.pid,
+                reason,
+                self.operation_timeout,
+                self.device_path,
+                self.connection,
+            )
+
+    def _stop_worker(self, kill=False):
+        proc = self._process
+        if proc is None:
+            return
+        try:
+            if proc.is_alive() and not kill and self._request_queue is not None:
+                request_id = str(uuid.uuid4())
+                self._request_queue.put({'id': request_id, 'operation': '_stop', 'args': (), 'kwargs': {}})
+                proc.join(timeout=5)
+        except Exception:
+            pass
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        if proc.is_alive():
+            try:
+                proc.kill()
+                proc.join(timeout=5)
+            except Exception:
+                pass
+        self._process = None
+        self._request_queue = None
+        self._response_queue = None
+
+    def _restart_after_timeout(self, operation):
+        logging.error(
+            "⏱️ Gammu operation '%s' timed out after %ss; killing isolated worker process",
+            operation,
+            self.operation_timeout,
+        )
+        self._start_worker(reason=f"timeout in {operation}")
+
+    def call(self, operation, *args, timeout=None, **kwargs):
+        timeout = int(timeout or self.operation_timeout)
+        with self._manager_lock:
+            if self._process is None or not self._process.is_alive():
+                self._start_worker(reason='worker not running')
+
+            request_id = str(uuid.uuid4())
+            self._request_queue.put({
+                'id': request_id,
+                'operation': operation,
+                'args': args,
+                'kwargs': kwargs,
+            })
+
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self._restart_after_timeout(operation)
+                    raise GammuOperationTimeout(
+                        f"Gammu operation '{operation}' timed out after {timeout}s"
+                    )
+
+                try:
+                    response = self._response_queue.get(timeout=min(remaining, 1.0))
+                except queue.Empty:
+                    if self._process is None or not self._process.is_alive():
+                        self._start_worker(reason=f'worker exited during {operation}')
+                        raise GammuWorkerError(
+                            f"Gammu worker exited during operation '{operation}'"
+                        )
+                    continue
+
+                if response.get('id') != request_id:
+                    # The main process serializes operations, so this should not normally happen.
+                    logging.warning("Ignoring stale Gammu worker response for request %s", response.get('id'))
+                    continue
+
+                if response.get('ok'):
+                    return response.get('result')
+
+                error = response.get('error') or response.get('error_repr') or 'Unknown Gammu worker error'
+                raise GammuWorkerError(error)
+
+    def reinitialize(self, reason='manual reinitialize'):
+        logging.warning("🔄 Reinitializing isolated Gammu worker (%s)...", reason)
+        try:
+            return self.call('reinitialize', timeout=max(self.operation_timeout, self.commtimeout + 30))
+        except Exception as e:
+            logging.warning("Worker reinitialize command failed, starting fresh process: %s", e)
+            self._start_worker(reason=reason)
+            return self.call('_ping', timeout=max(self.operation_timeout, self.commtimeout + 30))
+
+    def Terminate(self):
+        self._stop_worker(kill=False)
+        return True
+
+    def terminate(self):
+        return self.Terminate()
+
+    def __getattr__(self, name):
+        def _method(*args, **kwargs):
+            return self.call(name, *args, **kwargs)
+        return _method
 
 
 class GammuStateManager:
@@ -141,8 +421,24 @@ def init_state_machine(
     commtimeout=30,
     init_retries=1,
     init_retry_delay=5,
+    process_worker=True,
+    operation_timeout=90,
 ):
-    """Initialize gammu state manager with HA add-on config."""
+    """Initialize Gammu access for HA add-on config.
+
+    process_worker=True uses a child process that owns the modem. This is
+    safer than calling python-gammu directly from Flask/MQTT threads because a
+    blocked C/serial call can be killed by restarting the child process.
+    """
+    if process_worker:
+        return GammuProcessClient(
+            pin=pin,
+            device_path=device_path,
+            connection=connection,
+            commtimeout=commtimeout,
+            operation_timeout=operation_timeout,
+        )
+
     return GammuStateManager(
         pin=pin,
         device_path=device_path,

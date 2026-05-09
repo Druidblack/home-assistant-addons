@@ -114,7 +114,9 @@ def load_ha_config():
             'gammu_reinit_after_failures': 3,
             'gammu_reinit_cooldown': 60,
             'gammu_operation_delay': 0.3,
-            'callback_read_interval': 2
+            'callback_read_interval': 2,
+            'gammu_process_worker': True,
+            'gammu_operation_timeout': 90
         }
 
 # Load version and configuration
@@ -127,18 +129,9 @@ username = config.get('username', 'admin')
 password = config.get('password', 'password')
 device_path = config.get('device_path', '/dev/ttyUSB0')
 
-# Initialize MQTT publisher FIRST (before gammu)
-mqtt_publisher = MQTTPublisher(config)
-
-# Publish OFFLINE status immediately on startup (clears any stale "online" state)
-if mqtt_publisher.connected:
-    mqtt_publisher.device_tracker.initial_check_done = False  # Force offline
-    mqtt_publisher.publish_device_status()
-    logging.info("📡 Published initial OFFLINE status on startup")
-
-# Now initialize gammu state machine (this may fail if modem not connected)
-# The returned object is a reconnectable proxy, so all existing references remain valid
-# after full Gammu reinitialization.
+# Initialize Gammu access before starting MQTT background threads.
+# In stable3 the default Gammu backend uses a forked child process; forking is
+# safest before paho-mqtt starts its network loop thread.
 machine = init_state_machine(
     pin,
     device_path,
@@ -146,7 +139,18 @@ machine = init_state_machine(
     commtimeout=config.get('gammu_commtimeout', 30),
     init_retries=config.get('gammu_init_retries', 3),
     init_retry_delay=config.get('gammu_init_retry_delay', 5),
+    process_worker=config.get('gammu_process_worker', True),
+    operation_timeout=config.get('gammu_operation_timeout', 90),
 )
+
+# Initialize MQTT publisher after Gammu worker process has been created.
+mqtt_publisher = MQTTPublisher(config)
+
+# Publish OFFLINE status immediately on startup (clears any stale "online" state)
+if mqtt_publisher.connected:
+    mqtt_publisher.device_tracker.initial_check_done = False  # Force offline
+    mqtt_publisher.publish_device_status()
+    logging.info("📡 Published initial OFFLINE status on startup")
 
 # Set gammu machine for MQTT SMS sending
 mqtt_publisher.set_gammu_machine(machine)
@@ -160,6 +164,11 @@ def signal_handler(signum, frame):
     logging.info(f"🛑 Received shutdown signal {signum}, publishing offline status...")
     try:
         mqtt_publisher.disconnect()
+        try:
+            machine.Terminate()
+            logging.info("✅ Gammu worker terminated successfully")
+        except Exception as e:
+            logging.warning(f"⚠️ Error terminating Gammu worker: {e}")
         logging.info("✅ MQTT disconnected successfully")
     except Exception as e:
         logging.error(f"❌ Error during MQTT disconnect: {e}")
@@ -176,6 +185,10 @@ def cleanup():
     logging.info("🧹 Cleanup: Publishing offline status...")
     try:
         mqtt_publisher.disconnect()
+        try:
+            machine.Terminate()
+        except Exception:
+            pass
     except Exception as e:
         logging.error(f"Error during cleanup: {e}")
 
